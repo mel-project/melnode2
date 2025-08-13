@@ -44,6 +44,6 @@ fn staker_thread(storage: &Storage) -> anyhow::Result<()> {
             height = debug(block.header.height),
             "produced and applied a block"
         );
-        smol::future::block_on(&mut crystal);
+        // smol::future::block_on(&mut crystal);
     }
 }
