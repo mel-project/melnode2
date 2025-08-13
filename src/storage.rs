@@ -6,6 +6,7 @@ use rand::Rng;
 use sqlx::{SqlitePool, pool::PoolOptions, sqlite::SqliteConnectOptions};
 
 /// The main storage system of the node, which stores the blockchain history etc.
+#[derive(Clone)]
 pub struct Storage {
     mesha: Arc<meshanina::Mapping>,
     sqlite: SqlitePool,
@@ -19,6 +20,7 @@ impl Storage {
     ) -> anyhow::Result<Self> {
         let root_path = root_path.join(format!("chain-{}", chain_id.0));
         std::fs::create_dir_all(&root_path)?;
+        tracing::debug!(root_path = debug(&root_path), "loading storage");
 
         // open SMT store
         let mesha = Arc::new(meshanina::Mapping::open(&root_path.join("smt.db"))?);
