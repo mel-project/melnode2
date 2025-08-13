@@ -1,0 +1,16 @@
+[package]
+name = "melnode2"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.99"
+bcs = "0.1.6"
+
+clap = { version = "4.5", features = ["derive"] }
+mel2-stf = { path = "../mel2-stf" }
+meshanina = "0.5.1"
+novasmt = "0.3.0-alpha.3"
+smol = "2.0.2"
+sqlx = { version = "0.8.6", features = ["sqlite", "runtime-async-std"] }
+tmelcrypt = "0.2.7"
