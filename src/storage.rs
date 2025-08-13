@@ -1,7 +1,8 @@
-use std::{path::Path, str::FromStr, sync::Arc};
+use std::{path::Path, str::FromStr, sync::Arc, time::Duration};
 
 use mel2_stf::{Block, ChainId};
 use novasmt::NodeStore;
+use rand::Rng;
 use sqlx::{SqlitePool, pool::PoolOptions, sqlite::SqliteConnectOptions};
 
 /// The main storage system of the node, which stores the blockchain history etc.
@@ -58,25 +59,45 @@ impl Storage {
     pub fn apply_block(&self, block: &Block) -> anyhow::Result<()> {
         let latest_block = self.latest_block()?;
         let next_block = latest_block.apply_and_validate(block, &self.node_store())?;
+        // Flush meshanina before inserting pointer to it into the sqlite
         self.mesha.flush();
         smol::future::block_on(async move {
-            sqlx::query("insert into blocks values ($1, $2, $3)")
-                .bind(next_block.header.height as i64)
-                .bind(bcs::to_bytes(&next_block.header)?)
-                .bind(bcs::to_bytes(&next_block)?)
-                .execute(&self.sqlite)
-                .await?;
+            with_busy_retry(|| {
+                sqlx::query("insert into blocks values ($1, $2, $3)")
+                    .bind(next_block.header.height as i64)
+                    .bind(bcs::to_bytes(&next_block.header).unwrap())
+                    .bind(bcs::to_bytes(&next_block).unwrap())
+                    .execute(&self.sqlite)
+            })
+            .await?;
             Ok(())
         })
     }
 
     pub fn latest_block(&self) -> anyhow::Result<Block> {
         smol::future::block_on(async move {
-            let blk: Vec<u8> =
+            let blk: Vec<u8> = with_busy_retry(|| {
                 sqlx::query_scalar("select block from blocks order by height desc limit 1")
                     .fetch_one(&self.sqlite)
-                    .await?;
+            })
+            .await?;
             Ok(bcs::from_bytes(&blk)?)
+        })
+    }
+
+    pub fn get_block(&self, height: u64) -> anyhow::Result<Option<Block>> {
+        smol::future::block_on(async move {
+            let blk: Option<Vec<u8>> = with_busy_retry(|| {
+                sqlx::query_scalar("select block from blocks where height = $1")
+                    .bind(height as i64)
+                    .fetch_optional(&self.sqlite)
+            })
+            .await?;
+            if let Some(blk) = blk {
+                Ok(Some(bcs::from_bytes(&blk)?))
+            } else {
+                Ok(None)
+            }
         })
     }
 
@@ -173,5 +194,41 @@ mod tests {
         eprintln!("{:?}", storage.latest_block()?.header);
 
         Ok(())
+    }
+}
+
+fn is_sqlite_busy(err: &sqlx::Error) -> bool {
+    match err {
+        sqlx::Error::Database(db_err) => {
+            // SQLite’s primary code for BUSY is 5; sqlx exposes it as a string.
+            let code_is_busy = db_err.code().as_deref() == Some("5");
+            let msg_busy = db_err.message().contains("database is locked")
+                || db_err.message().contains("database is busy");
+            code_is_busy || msg_busy
+        }
+        _ => false,
+    }
+}
+
+async fn with_busy_retry<F, Fut, T>(mut op: F) -> Result<T, sqlx::Error>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, sqlx::Error>>,
+{
+    let mut delay = Duration::from_millis(10);
+    let max_delay = Duration::from_millis(500); // cap the per-retry sleep
+
+    loop {
+        match op().await {
+            Ok(v) => return Ok(v),
+            Err(e) if is_sqlite_busy(&e) => {
+                // add a little jitter to avoid thundering herd
+                let jitter = rand::rng().random_range(0..delay.as_millis() as u64 + 1);
+                smol::Timer::after(delay + Duration::from_millis(jitter as u64)).await;
+                // exponential backoff with cap
+                delay = std::cmp::min(delay * 2, max_delay);
+            }
+            Err(e) => return Err(e),
+        }
     }
 }
