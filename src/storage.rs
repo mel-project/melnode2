@@ -59,7 +59,7 @@ impl Storage {
     }
 
     pub fn apply_block(&self, block: &Block) -> anyhow::Result<()> {
-        let latest_block = self.latest_block()?;
+        let latest_block = self.highest_block()?;
         let next_block = latest_block.apply_and_validate(block, &self.node_store())?;
         // Flush meshanina before inserting pointer to it into the sqlite
         self.mesha.flush();
@@ -76,7 +76,7 @@ impl Storage {
         })
     }
 
-    pub fn latest_block(&self) -> anyhow::Result<Block> {
+    pub fn highest_block(&self) -> anyhow::Result<Block> {
         smol::future::block_on(async move {
             let blk: Vec<u8> = with_busy_retry(|| {
                 sqlx::query_scalar("select block from blocks order by height desc limit 1")
@@ -84,6 +84,16 @@ impl Storage {
             })
             .await?;
             Ok(bcs::from_bytes(&blk)?)
+        })
+    }
+
+    pub fn highest_height(&self) -> anyhow::Result<u64> {
+        smol::future::block_on(async move {
+            let height: i64 = with_busy_retry(|| {
+                sqlx::query_scalar("select max(height) from blocks").fetch_one(&self.sqlite)
+            })
+            .await?;
+            Ok(height as u64)
         })
     }
 
@@ -154,7 +164,7 @@ mod tests {
         let storage = Storage::open(&root, chain_id, || make_genesis())?;
 
         for _ in 0..10 {
-            let latest = storage.latest_block()?;
+            let latest = storage.highest_block()?;
             let next = latest
                 .next_block(&storage.node_store())
                 .sealed(SealingInfo {
@@ -179,7 +189,7 @@ mod tests {
         std::thread::scope(|s| {
             for _ in 0..10 {
                 s.spawn(|| {
-                    let latest = storage.latest_block().unwrap();
+                    let latest = storage.highest_block().unwrap();
                     let next = latest
                         .next_block(&storage.node_store())
                         .sealed(SealingInfo {
@@ -193,7 +203,7 @@ mod tests {
             }
         });
 
-        eprintln!("{:?}", storage.latest_block()?.header);
+        eprintln!("{:?}", storage.highest_block()?.header);
 
         Ok(())
     }

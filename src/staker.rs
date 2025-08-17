@@ -32,7 +32,7 @@ impl StakerHandle {
 fn staker_thread(storage: &Storage) -> anyhow::Result<()> {
     let mut crystal = smol::Timer::interval(Duration::from_secs(30));
     loop {
-        let block = storage.latest_block()?;
+        let block = storage.highest_block()?;
         let next_block = block
             .next_block(&storage.node_store())
             .sealed(SealingInfo {
@@ -44,6 +44,6 @@ fn staker_thread(storage: &Storage) -> anyhow::Result<()> {
             height = debug(block.header.height),
             "produced and applied a block"
         );
-        // smol::future::block_on(&mut crystal);
+        smol::future::block_on(&mut crystal);
     }
 }

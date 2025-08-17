@@ -1,20 +1,28 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use clap::Parser;
 use mel2_stf::{Address, Block, ChainId};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::{
+    node::NodeHandle,
     staker::{StakerConfig, StakerHandle},
     storage::Storage,
 };
 
+mod node;
+mod rpc;
 mod staker;
 mod storage;
 
 #[derive(Parser, Debug)]
 #[command(version, about)]
 pub struct Args {
+    #[arg(long)]
+    connect: Option<SocketAddr>,
+    #[arg(long)]
+    listen: Option<SocketAddr>,
+
     #[arg(long)]
     db_path: Option<PathBuf>,
 
@@ -53,8 +61,11 @@ fn main() {
             staker_sk_seed: "jskldfjsdf".into(),
             proposer_addr: Address::ZERO,
         },
-        storage,
+        storage.clone(),
     );
+
+    // Spawn node networking (client/server) based on CLI args
+    let _node = NodeHandle::spawn(args.connect, args.listen, storage);
 
     loop {
         std::thread::park();
