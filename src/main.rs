@@ -19,6 +19,9 @@ mod storage;
 #[command(version, about)]
 pub struct Args {
     #[arg(long)]
+    staker: bool,
+
+    #[arg(long)]
     connect: Option<SocketAddr>,
     #[arg(long)]
     listen: Option<SocketAddr>,
@@ -56,13 +59,15 @@ fn main() {
         .expect("could not initialize storage"),
     );
 
-    let staker = StakerHandle::spawn(
-        StakerConfig {
-            staker_sk_seed: "jskldfjsdf".into(),
-            proposer_addr: Address::ZERO,
-        },
-        storage.clone(),
-    );
+    if args.staker {
+        StakerHandle::spawn(
+            StakerConfig {
+                staker_sk_seed: "jskldfjsdf".into(),
+                proposer_addr: Address::ZERO,
+            },
+            storage.clone(),
+        );
+    }
 
     // Spawn node networking (client/server) based on CLI args
     let _node = NodeHandle::spawn(args.connect, args.listen, storage);

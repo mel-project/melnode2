@@ -23,7 +23,7 @@ impl Storage {
         tracing::debug!(root_path = debug(&root_path), "loading storage");
 
         // open SMT store
-        let mesha = Arc::new(meshanina::Mapping::open(&root_path.join("smt.db"))?);
+        let mesha = Arc::new(meshanina::Mapping::open(root_path.join("smt.db"))?);
 
         // open SQLite store
         let options =
@@ -72,6 +72,7 @@ impl Storage {
                     .execute(&self.sqlite)
             })
             .await?;
+            tracing::debug!(height = next_block.header.height, "applied block");
             Ok(())
         })
     }
@@ -122,89 +123,11 @@ struct MeshaNodeSource(Arc<meshanina::Mapping>);
 
 impl NodeStore for MeshaNodeSource {
     fn get(&self, key: &[u8]) -> Result<Option<std::borrow::Cow<'_, [u8]>>, novasmt::SmtError> {
-        Ok(self.0.get(tmelcrypt::hash_single(&key).0))
+        Ok(self.0.get(tmelcrypt::hash_single(key).0))
     }
 
     fn insert(&self, key: &[u8], value: &[u8]) -> Result<(), novasmt::SmtError> {
-        self.0.insert(tmelcrypt::hash_single(&key).0, value);
-        Ok(())
-    }
-}
-
-// put this in the same file/module as `Storage` (or adjust visibility as needed)
-#[cfg(test)]
-mod tests {
-    use mel2_stf::{Address, SealingInfo};
-
-    use super::*;
-    use std::{
-        path::PathBuf,
-        time::{SystemTime, UNIX_EPOCH},
-    };
-
-    fn tmp_root() -> PathBuf {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        PathBuf::from(format!("/tmp/storage/{now}"))
-    }
-
-    fn make_genesis() -> mel2_stf::Block {
-        mel2_stf::Block::testnet_genesis()
-    }
-
-    #[test]
-    fn open_initializes_once_and_uses_tmp() -> anyhow::Result<()> {
-        // Arrange a fresh root in /tmp and a chain id
-        let root = tmp_root();
-        let chain_id = mel2_stf::ChainId::BETANET;
-
-        // Act: first open should create `/tmp/.../chain-7` and insert genesis
-        let storage = Storage::open(&root, chain_id, || make_genesis())?;
-
-        for _ in 0..10 {
-            let latest = storage.highest_block()?;
-            let next = latest
-                .next_block(&storage.node_store())
-                .sealed(SealingInfo {
-                    proposer: Address::ZERO,
-                    new_gas_price: mel2_stf::Quantity(1_000_000),
-                })?;
-            storage.apply_block(&next)?;
-        }
-
-        Ok(())
-    }
-
-    #[test]
-    fn concurrent_apply_block_fail() -> anyhow::Result<()> {
-        // Arrange a fresh root in /tmp and a chain id
-        let root = tmp_root();
-        let chain_id = mel2_stf::ChainId::BETANET;
-
-        // Act: first open should create `/tmp/.../chain-7` and insert genesis
-        let storage = Storage::open(&root, chain_id, || make_genesis())?;
-
-        std::thread::scope(|s| {
-            for _ in 0..10 {
-                s.spawn(|| {
-                    let latest = storage.highest_block().unwrap();
-                    let next = latest
-                        .next_block(&storage.node_store())
-                        .sealed(SealingInfo {
-                            proposer: Address::ZERO,
-                            new_gas_price: mel2_stf::Quantity(1_000_000),
-                        })
-                        .unwrap();
-                    let succeeded = storage.apply_block(&next).is_ok();
-                    dbg!(succeeded);
-                });
-            }
-        });
-
-        eprintln!("{:?}", storage.highest_block()?.header);
-
+        self.0.insert(tmelcrypt::hash_single(key).0, value);
         Ok(())
     }
 }
@@ -242,5 +165,83 @@ where
             }
             Err(e) => return Err(e),
         }
+    }
+}
+
+// put this in the same file/module as `Storage` (or adjust visibility as needed)
+#[cfg(test)]
+mod tests {
+    use mel2_stf::{Address, SealingInfo};
+
+    use super::*;
+    use std::{
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    fn tmp_root() -> PathBuf {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        PathBuf::from(format!("/tmp/storage/{now}"))
+    }
+
+    fn make_genesis() -> mel2_stf::Block {
+        mel2_stf::Block::testnet_genesis()
+    }
+
+    #[test]
+    fn open_initializes_once_and_uses_tmp() -> anyhow::Result<()> {
+        // Arrange a fresh root in /tmp and a chain id
+        let root = tmp_root();
+        let chain_id = mel2_stf::ChainId::BETANET;
+
+        // Act: first open should create `/tmp/.../chain-7` and insert genesis
+        let storage = Storage::open(&root, chain_id, make_genesis)?;
+
+        for _ in 0..10 {
+            let latest = storage.highest_block()?;
+            let next = latest
+                .next_block(&storage.node_store())
+                .sealed(SealingInfo {
+                    proposer: Address::ZERO,
+                    new_gas_price: mel2_stf::Quantity(1_000_000),
+                })?;
+            storage.apply_block(&next)?;
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_apply_block_fail() -> anyhow::Result<()> {
+        // Arrange a fresh root in /tmp and a chain id
+        let root = tmp_root();
+        let chain_id = mel2_stf::ChainId::BETANET;
+
+        // Act: first open should create `/tmp/.../chain-7` and insert genesis
+        let storage = Storage::open(&root, chain_id, make_genesis)?;
+
+        std::thread::scope(|s| {
+            for _ in 0..10 {
+                s.spawn(|| {
+                    let latest = storage.highest_block().unwrap();
+                    let next = latest
+                        .next_block(&storage.node_store())
+                        .sealed(SealingInfo {
+                            proposer: Address::ZERO,
+                            new_gas_price: mel2_stf::Quantity(1_000_000),
+                        })
+                        .unwrap();
+                    let succeeded = storage.apply_block(&next).is_ok();
+                    dbg!(succeeded);
+                });
+            }
+        });
+
+        eprintln!("{:?}", storage.highest_block()?.header);
+
+        Ok(())
     }
 }

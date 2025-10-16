@@ -1,3 +1,5 @@
+mod consensus;
+
 use std::{sync::Arc, thread::JoinHandle, time::Duration};
 
 use mel2_stf::{Address, Quantity, SealingInfo};
@@ -39,11 +41,8 @@ fn staker_thread(storage: &Storage) -> anyhow::Result<()> {
                 proposer: Address::ZERO,
                 new_gas_price: Quantity(1_000_000),
             })?;
+        tracing::debug!(height = debug(next_block.header.height), "produced a block");
         storage.apply_block(&next_block)?;
-        tracing::debug!(
-            height = debug(block.header.height),
-            "produced and applied a block"
-        );
         smol::future::block_on(&mut crystal);
     }
 }

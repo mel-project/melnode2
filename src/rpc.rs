@@ -82,6 +82,7 @@ pub async fn run_rpc_server(addr: SocketAddr, srv: impl RpcService) -> anyhow::R
                 let mut read = BufReader::new(conn.clone());
                 let mut buff = String::new();
                 loop {
+                    buff.clear();
                     (&mut read).take(10000).read_line(&mut buff).await?;
                     let resp = serde_json::to_string(
                         &srv.respond_raw(serde_json::from_str(&buff)?).await,

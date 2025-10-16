@@ -1,13 +1,8 @@
 use std::{net::SocketAddr, sync::Arc, thread::JoinHandle, time::Duration};
 
 use async_trait::async_trait;
-use bytes::Bytes;
-use mel2_stf::Block;
-use nanorpc::{RpcService, nanorpc_derive};
-use serde::{Deserialize, Serialize};
 
 use crate::{
-    Args,
     rpc::{
         BlockProof, BlockWithProof, NodeClient, NodeProtocol, NodeService, RpcClient,
         run_rpc_server,
@@ -79,6 +74,7 @@ fn sync_next_block(client: &NodeClient<RpcClient>, storage: &Storage) -> anyhow:
         storage.apply_block(&blk.block)?;
         Ok(true)
     } else {
+        tracing::debug!(next, "no such block yet...");
         Ok(false)
     }
 }
