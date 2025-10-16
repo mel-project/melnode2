@@ -247,10 +247,13 @@ pub enum ConsensusMsg {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use mel2_stf::Block;
     use tmelcrypt::Ed25519SK;
 
-    use crate::staker::consensus::{ConsensusConfig, ConsensusState};
+    use super::Header;
+    use crate::staker::consensus::{ConsensusConfig, ConsensusMsg, ConsensusState};
 
     #[test]
     fn basic_consensus() {
@@ -258,9 +261,36 @@ mod tests {
         let genesis = Block::testnet_genesis().header;
         let cfg = ConsensusConfig {
             genesis,
-            vote_weights: [(one_staker_sk, 1)].iter().cloned().collect(),
+            vote_weights: std::collections::HashMap::from([(
+                one_staker_sk.to_public(),
+                1u64,
+            )]),
         };
-        let state = ConsensusState::new(cfg, one_staker_sk, 0);
-        todo!()
+        let mut state = ConsensusState::new(cfg, one_staker_sk, 0);
+        let genesis_hash = tmelcrypt::hash_single(bcs::to_bytes(&genesis).unwrap());
+
+        state.blocks.insert(
+            genesis_hash,
+            super::BlockInfo {
+                received: Instant::now(),
+                header: genesis,
+                epoch: 0,
+                votes: Default::default(),
+            },
+        );
+
+        let proposal = Header {
+            prev: genesis_hash,
+            height: genesis.height + 1,
+            ..genesis
+        };
+
+        state
+            .process_msg(ConsensusMsg::Propose(proposal, 0))
+            .expect("proposal should be processed");
+
+        let graphviz = state.debug_graphviz();
+        println!("{graphviz}");
+        assert!(graphviz.contains("digraph Consensus"));
     }
 }
