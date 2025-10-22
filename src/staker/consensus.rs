@@ -1,28 +1,32 @@
 use std::{collections::HashMap, time::Instant};
 
-use mel2_stf::Header;
+use anyhow::Context;
+use mel2_stf::{Block, Header};
+use novasmt::NodeStore;
 use serde::{Deserialize, Serialize};
 use tmelcrypt::{Ed25519PK, Ed25519SK, HashVal};
 
 pub struct ConsensusState {
-    genesis: Header,
+    genesis: Block,
     epoch_to_block: HashMap<u64, Vec<HashVal>>,
     blocks: HashMap<HashVal, BlockInfo>,
     vote_weights: HashMap<Ed25519PK, u64>,
     my_sk: Ed25519SK,
 
     current_epoch: u64,
+
+    outgoing_msg: Vec<ConsensusMsg>,
 }
 
 struct BlockInfo {
     received: Instant,
-    header: Header,
+    block: Block,
     epoch: u64,
     votes: HashMap<Ed25519PK, Vec<u8>>,
 }
 
 pub struct ConsensusConfig {
-    pub genesis: Header,
+    pub genesis: Block,
     pub vote_weights: HashMap<Ed25519PK, u64>,
 }
 
@@ -35,20 +39,50 @@ impl ConsensusState {
             vote_weights: cfg.vote_weights,
             my_sk,
             current_epoch,
+
+            outgoing_msg: vec![],
         }
     }
 
-    pub fn add_block(&mut self, header: Header, epoch: u64) -> anyhow::Result<()> {
-        if !self.blocks.contains_key(&header.prev) {
-            anyhow::bail!("parent block doesn't exist")
+    pub fn process_msg(&mut self, msg: ConsensusMsg, store: &impl NodeStore) -> anyhow::Result<()> {
+        match msg {
+            ConsensusMsg::Propose(block, epoch) => {
+                self.add_block(block, epoch, store)?;
+                self.generate_votes()
+            }
+            ConsensusMsg::Vote(block_hash, voter, vote) => self.add_vote(block_hash, voter, vote),
         }
-        // TODO: actually validate the block!!
-        let bhash = tmelcrypt::hash_single(bcs::to_bytes(&header)?);
+    }
+
+    pub fn drain_msg(&mut self) -> Vec<ConsensusMsg> {
+        std::mem::take(&mut self.outgoing_msg)
+    }
+
+    fn get_block(&self, hash: HashVal) -> anyhow::Result<&Block> {
+        if hash == self.genesis_hash() {
+            Ok(&self.genesis)
+        } else {
+            Ok(&self.blocks.get(&hash).context("no such block")?.block)
+        }
+    }
+
+    fn add_block(
+        &mut self,
+        block: Block,
+        epoch: u64,
+        store: &impl NodeStore,
+    ) -> anyhow::Result<()> {
+        let prev = self
+            .get_block(block.header.prev)
+            .context("parent block does not exist")?;
+        let block = prev.apply_and_validate(&block, store)?;
+
+        let bhash = tmelcrypt::hash_single(bcs::to_bytes(&block.header)?);
         self.blocks.insert(
             bhash,
             BlockInfo {
                 received: Instant::now(),
-                header,
+                block,
                 epoch,
                 votes: Default::default(),
             },
@@ -57,7 +91,7 @@ impl ConsensusState {
         Ok(())
     }
 
-    pub fn add_vote(
+    fn add_vote(
         &mut self,
         block_hash: HashVal,
         voter: Ed25519PK,
@@ -78,16 +112,6 @@ impl ConsensusState {
             .votes
             .insert(voter, vote);
         Ok(())
-    }
-
-    pub fn process_msg(&mut self, msg: ConsensusMsg) -> anyhow::Result<()> {
-        match msg {
-            ConsensusMsg::Propose(header, epoch) => {
-                self.add_block(header, epoch)?;
-                self.generate_votes()
-            }
-            ConsensusMsg::Vote(block_hash, voter, vote) => self.add_vote(block_hash, voter, vote),
-        }
     }
 
     pub fn debug_graphviz(&self) -> String {
@@ -128,7 +152,7 @@ impl ConsensusState {
                 format!(
                     "    \"{}\" -> \"{}\";\n",
                     hash.to_string(),
-                    info.header.prev.to_string()
+                    info.block.header.prev.to_string()
                 )
             })
             .collect();
@@ -151,16 +175,17 @@ impl ConsensusState {
             .unwrap_or_default()
         {
             let nfo = self.blocks.get(&proposal).unwrap();
-            if nfo.header.prev == *lnc.last().unwrap() {
+            if nfo.block.header.prev == *lnc.last().unwrap() {
                 // we found the right one to vote for
-                self.add_vote(
+                let vote = ConsensusMsg::Vote(
                     proposal,
                     self.my_sk.to_public(),
                     self.my_sk.sign(&tmelcrypt::hash_keyed(
                         b"sl-internal-vote",
-                        tmelcrypt::hash_single(&bcs::to_bytes(&nfo.header)?),
+                        tmelcrypt::hash_single(&bcs::to_bytes(&nfo.block.header)?),
                     )),
-                )?;
+                );
+                self.outgoing_msg.push(vote);
             }
         }
         Ok(())
@@ -173,7 +198,7 @@ impl ConsensusState {
         let mut children: HashMap<HashVal, Vec<HashVal>> = HashMap::new();
         for (bhash, block_info) in &self.blocks {
             children
-                .entry(block_info.header.prev)
+                .entry(block_info.block.header.prev)
                 .or_default()
                 .push(*bhash);
         }
@@ -215,7 +240,9 @@ impl ConsensusState {
     }
 
     fn genesis_hash(&self) -> HashVal {
-        tmelcrypt::hash_single(bcs::to_bytes(&self.genesis).expect("genesis serialization failed"))
+        tmelcrypt::hash_single(
+            bcs::to_bytes(&self.genesis.header).expect("genesis serialization failed"),
+        )
     }
 
     fn block_vote_weight(&self, block: &BlockInfo) -> u64 {
@@ -241,7 +268,7 @@ impl ConsensusState {
 
 #[derive(Serialize, Deserialize)]
 pub enum ConsensusMsg {
-    Propose(Header, u64),
+    Propose(Block, u64),
     Vote(HashVal, Ed25519PK, Vec<u8>),
 }
 
@@ -249,7 +276,8 @@ pub enum ConsensusMsg {
 mod tests {
     use std::time::Instant;
 
-    use mel2_stf::Block;
+    use mel2_stf::{Address, Block, Quantity, SealingInfo};
+    use novasmt::InMemoryStore;
     use tmelcrypt::Ed25519SK;
 
     use super::Header;
@@ -257,14 +285,12 @@ mod tests {
 
     #[test]
     fn basic_consensus() {
+        let nstore = InMemoryStore::default();
         let one_staker_sk = Ed25519SK::generate();
-        let genesis = Block::testnet_genesis().header;
+        let genesis = Block::testnet_genesis();
         let cfg = ConsensusConfig {
-            genesis,
-            vote_weights: std::collections::HashMap::from([(
-                one_staker_sk.to_public(),
-                1u64,
-            )]),
+            genesis: genesis.clone(),
+            vote_weights: std::collections::HashMap::from([(one_staker_sk.to_public(), 1u64)]),
         };
         let mut state = ConsensusState::new(cfg, one_staker_sk, 0);
         let genesis_hash = tmelcrypt::hash_single(bcs::to_bytes(&genesis).unwrap());
@@ -273,20 +299,22 @@ mod tests {
             genesis_hash,
             super::BlockInfo {
                 received: Instant::now(),
-                header: genesis,
+                block: genesis.clone(),
                 epoch: 0,
                 votes: Default::default(),
             },
         );
 
-        let proposal = Header {
-            prev: genesis_hash,
-            height: genesis.height + 1,
-            ..genesis
-        };
+        let proposal = genesis
+            .next_block(&nstore)
+            .sealed(SealingInfo {
+                proposer: Address::ZERO,
+                new_gas_price: genesis.seal_info.new_gas_price,
+            })
+            .unwrap();
 
         state
-            .process_msg(ConsensusMsg::Propose(proposal, 0))
+            .process_msg(ConsensusMsg::Propose(proposal, 0), &nstore)
             .expect("proposal should be processed");
 
         let graphviz = state.debug_graphviz();
