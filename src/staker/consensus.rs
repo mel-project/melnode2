@@ -44,6 +44,30 @@ impl ConsensusState {
         }
     }
 
+    pub fn propose(&mut self, gen_prop: impl FnOnce(&Block) -> Block) {
+        // TODO: not everybody is supposed to propose every epoch, but we're going to do so anyway.
+        let longest_chain = self.longest_notarized_chain();
+        let parent_hash = longest_chain
+            .last()
+            .copied()
+            .unwrap_or_else(|| self.genesis_hash());
+
+        let proposal = {
+            let parent_block = self
+                .get_block(parent_hash)
+                .expect("parent block for proposal must exist");
+            gen_prop(parent_block)
+        };
+
+        assert_eq!(
+            proposal.header.prev, parent_hash,
+            "generated proposal must extend the parent block"
+        );
+
+        self.outgoing_msg
+            .push(ConsensusMsg::Propose(proposal.clone(), self.current_epoch));
+    }
+
     pub fn process_msg(&mut self, msg: ConsensusMsg, store: &impl NodeStore) -> anyhow::Result<()> {
         match msg {
             ConsensusMsg::Propose(block, epoch) => {
@@ -56,6 +80,10 @@ impl ConsensusState {
 
     pub fn drain_msg(&mut self) -> Vec<ConsensusMsg> {
         std::mem::take(&mut self.outgoing_msg)
+    }
+
+    pub fn tick_epoch(&mut self) {
+        self.current_epoch += 1;
     }
 
     fn get_block(&self, hash: HashVal) -> anyhow::Result<&Block> {
@@ -123,6 +151,7 @@ impl ConsensusState {
         hashes.dedup();
 
         let mut graph = String::from("digraph Consensus {\n    node [shape=box];\n");
+        let total_weight = self.vote_weights.values().copied().sum::<u64>() as f64;
 
         for hash in &hashes {
             let hash_str = hash.to_string();
@@ -132,10 +161,15 @@ impl ConsensusState {
             } else {
                 (0, 0)
             };
+            let weight_percentage = if total_weight > 0.0 {
+                (weight as f64 / total_weight) * 100.0
+            } else {
+                0.0
+            };
 
             graph.push_str(&format!(
-                "    \"{}\" [label=\"{}\\nEpoch: {}\\nWeight: {}\"",
-                hash_str, short_hash, epoch, weight
+                "    \"{}\" [label=\"{}\\nEpoch: {}\\nWeight: {:.2}%\"",
+                hash_str, short_hash, epoch, weight_percentage
             ));
 
             if self.is_notarized(hash) {
@@ -293,29 +327,17 @@ mod tests {
             vote_weights: std::collections::HashMap::from([(one_staker_sk.to_public(), 1u64)]),
         };
         let mut state = ConsensusState::new(cfg, one_staker_sk, 0);
-        let genesis_hash = tmelcrypt::hash_single(bcs::to_bytes(&genesis).unwrap());
 
-        state.blocks.insert(
-            genesis_hash,
-            super::BlockInfo {
-                received: Instant::now(),
-                block: genesis.clone(),
-                epoch: 0,
-                votes: Default::default(),
-            },
-        );
-
-        let proposal = genesis
-            .next_block(&nstore)
-            .sealed(SealingInfo {
-                proposer: Address::ZERO,
-                new_gas_price: genesis.seal_info.new_gas_price,
-            })
-            .unwrap();
-
-        state
-            .process_msg(ConsensusMsg::Propose(proposal, 0), &nstore)
-            .expect("proposal should be processed");
+        for _ in 0..5 {
+            state.propose(|block| block.next_block(&nstore).sealed(block.seal_info).unwrap());
+            for msg in state.drain_msg() {
+                state.process_msg(msg, &nstore).unwrap();
+            }
+            for msg in state.drain_msg() {
+                state.process_msg(msg, &nstore).unwrap();
+            }
+            state.tick_epoch();
+        }
 
         let graphviz = state.debug_graphviz();
         println!("{graphviz}");
