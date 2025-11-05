@@ -1,4 +1,4 @@
-mod consensus;
+mod consensus_state;
 
 use std::{sync::Arc, thread::JoinHandle, time::Duration};
 

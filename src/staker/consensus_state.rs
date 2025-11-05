@@ -1,16 +1,18 @@
-use std::{collections::HashMap, time::Instant};
+use std::{collections::BTreeMap, time::Instant};
 
 use anyhow::Context;
-use mel2_stf::{Block, Header};
+use arrayref::array_ref;
+use mel2_stf::Block;
 use novasmt::NodeStore;
 use serde::{Deserialize, Serialize};
 use tmelcrypt::{Ed25519PK, Ed25519SK, HashVal};
 
 pub struct ConsensusState {
+    seed: HashVal,
     genesis: Block,
-    epoch_to_block: HashMap<u64, Vec<HashVal>>,
-    blocks: HashMap<HashVal, BlockInfo>,
-    vote_weights: HashMap<Ed25519PK, u64>,
+    epoch_to_block: BTreeMap<u64, Vec<HashVal>>,
+    blocks: BTreeMap<HashVal, BlockInfo>,
+    vote_weights: BTreeMap<Ed25519PK, u64>,
     my_sk: Ed25519SK,
 
     current_epoch: u64,
@@ -22,17 +24,19 @@ struct BlockInfo {
     received: Instant,
     block: Block,
     epoch: u64,
-    votes: HashMap<Ed25519PK, Vec<u8>>,
+    votes: BTreeMap<Ed25519PK, Vec<u8>>,
 }
 
 pub struct ConsensusConfig {
     pub genesis: Block,
-    pub vote_weights: HashMap<Ed25519PK, u64>,
+    pub vote_weights: BTreeMap<Ed25519PK, u64>,
+    pub seed: HashVal,
 }
 
 impl ConsensusState {
     pub fn new(cfg: ConsensusConfig, my_sk: Ed25519SK, current_epoch: u64) -> Self {
         Self {
+            seed: cfg.seed,
             genesis: cfg.genesis,
             epoch_to_block: Default::default(),
             blocks: Default::default(),
@@ -151,7 +155,7 @@ impl ConsensusState {
         hashes.dedup();
 
         let mut graph = String::from("digraph Consensus {\n    node [shape=box];\n");
-        let total_weight = self.vote_weights.values().copied().sum::<u64>() as f64;
+        let total_weight = self.total_votes() as f64;
 
         for hash in &hashes {
             let hash_str = hash.to_string();
@@ -172,7 +176,9 @@ impl ConsensusState {
                 hash_str, short_hash, epoch, weight_percentage
             ));
 
-            if self.is_notarized(hash) {
+            if self.is_finalized(hash) {
+                graph.push_str(", style=\"filled\", fillcolor=\"gold\"");
+            } else if self.is_notarized(hash) {
                 graph.push_str(", style=\"filled\", fillcolor=\"lightblue\"");
             }
 
@@ -229,7 +235,7 @@ impl ConsensusState {
         let genesis_hash = self.genesis_hash();
 
         // Build parent -> children mapping
-        let mut children: HashMap<HashVal, Vec<HashVal>> = HashMap::new();
+        let mut children: BTreeMap<HashVal, Vec<HashVal>> = BTreeMap::new();
         for (bhash, block_info) in &self.blocks {
             children
                 .entry(block_info.block.header.prev)
@@ -240,7 +246,7 @@ impl ConsensusState {
         // DFS to find longest notarized chain
         fn dfs<F>(
             current: HashVal,
-            children: &HashMap<HashVal, Vec<HashVal>>,
+            children: &BTreeMap<HashVal, Vec<HashVal>>,
             is_notarized: &F,
         ) -> Vec<HashVal>
         where
@@ -269,7 +275,7 @@ impl ConsensusState {
     }
 
     fn quorum(&self) -> u64 {
-        let n = self.vote_weights.values().copied().sum::<u64>();
+        let n = self.total_votes();
         2 * n / 3 + 1
     }
 
@@ -288,6 +294,92 @@ impl ConsensusState {
             .sum()
     }
 
+    fn total_votes(&self) -> u64 {
+        self.vote_weights.values().copied().sum::<u64>()
+    }
+
+    fn block_epoch(&self, hash: &HashVal) -> Option<u64> {
+        if *hash == self.genesis_hash() {
+            Some(0)
+        } else {
+            self.blocks.get(hash).map(|info| info.epoch)
+        }
+    }
+
+    fn is_ancestor(&self, ancestor: &HashVal, mut descendant: HashVal) -> bool {
+        if ancestor == &descendant {
+            return true;
+        }
+
+        let genesis_hash = self.genesis_hash();
+        loop {
+            if descendant == genesis_hash {
+                return ancestor == &genesis_hash;
+            }
+            let info = match self.blocks.get(&descendant) {
+                Some(info) => info,
+                None => return false,
+            };
+            descendant = info.block.header.prev;
+            if ancestor == &descendant {
+                return true;
+            }
+        }
+    }
+
+    fn is_finalized(&self, bhash: &HashVal) -> bool {
+        if *bhash == self.genesis_hash() {
+            return true;
+        }
+        if !self.blocks.contains_key(bhash) {
+            return false;
+        }
+
+        let mut children: BTreeMap<HashVal, Vec<HashVal>> = BTreeMap::new();
+        for (hash, info) in &self.blocks {
+            children
+                .entry(info.block.header.prev)
+                .or_default()
+                .push(*hash);
+        }
+
+        for (middle_hash, middle_info) in &self.blocks {
+            if !self.is_notarized(middle_hash) {
+                continue;
+            }
+            let parent_hash = middle_info.block.header.prev;
+            if !self.is_notarized(&parent_hash) {
+                continue;
+            }
+            let Some(parent_epoch) = self.block_epoch(&parent_hash) else {
+                continue;
+            };
+            if parent_epoch + 1 != middle_info.epoch {
+                continue;
+            }
+            let Some(child_hashes) = children.get(middle_hash) else {
+                continue;
+            };
+
+            for child_hash in child_hashes {
+                if !self.is_notarized(child_hash) {
+                    continue;
+                }
+                let Some(child_info) = self.blocks.get(child_hash) else {
+                    continue;
+                };
+                if middle_info.epoch + 1 != child_info.epoch {
+                    continue;
+                }
+                if self.is_ancestor(bhash, *middle_hash) {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
     fn is_notarized(&self, bhash: &HashVal) -> bool {
         if bhash == &self.genesis_hash() {
             return true;
@@ -297,6 +389,33 @@ impl ConsensusState {
             .get(bhash)
             .map(|block| self.block_vote_weight(block) >= self.quorum())
             .unwrap_or(false)
+    }
+
+    fn proposer_for_epoch(&self, epoch: u64) -> Ed25519PK {
+        let total_votes = self.total_votes();
+        let rando = uniform_rand_modulo(
+            tmelcrypt::hash_keyed(self.seed, epoch.to_be_bytes()),
+            total_votes,
+        );
+        let mut sum = 0;
+        for (voter, weight) in self.vote_weights.iter() {
+            sum += *weight;
+            if sum > rando {
+                return *voter;
+            }
+        }
+        unreachable!()
+    }
+}
+
+fn uniform_rand_modulo(mut seed: HashVal, modulo: u64) -> u64 {
+    let safe_modulo = modulo.next_power_of_two();
+    loop {
+        seed = tmelcrypt::hash_single(seed); // guard against nonrandom seeds being passed in
+        let rand = u64::from_be_bytes(*array_ref![seed.0, 0, 8]) % safe_modulo;
+        if rand < modulo {
+            return rand;
+        }
     }
 }
 
@@ -308,14 +427,13 @@ pub enum ConsensusMsg {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
+    use std::collections::BTreeMap;
 
-    use mel2_stf::{Address, Block, Quantity, SealingInfo};
+    use mel2_stf::Block;
     use novasmt::InMemoryStore;
     use tmelcrypt::Ed25519SK;
 
-    use super::Header;
-    use crate::staker::consensus::{ConsensusConfig, ConsensusMsg, ConsensusState};
+    use crate::staker::consensus_state::{ConsensusConfig, ConsensusState};
 
     #[test]
     fn basic_consensus() {
@@ -323,8 +441,9 @@ mod tests {
         let one_staker_sk = Ed25519SK::generate();
         let genesis = Block::testnet_genesis();
         let cfg = ConsensusConfig {
+            seed: Default::default(),
             genesis: genesis.clone(),
-            vote_weights: std::collections::HashMap::from([(one_staker_sk.to_public(), 1u64)]),
+            vote_weights: BTreeMap::from([(one_staker_sk.to_public(), 1u64)]),
         };
         let mut state = ConsensusState::new(cfg, one_staker_sk, 0);
 
@@ -342,5 +461,70 @@ mod tests {
         let graphviz = state.debug_graphviz();
         println!("{graphviz}");
         assert!(graphviz.contains("digraph Consensus"));
+    }
+
+    #[test]
+    fn streamlet_finalization_rule() {
+        let nstore = InMemoryStore::default();
+        let staker_sk = Ed25519SK::generate();
+        let genesis = Block::testnet_genesis();
+        let cfg = ConsensusConfig {
+            seed: Default::default(),
+            genesis: genesis.clone(),
+            vote_weights: BTreeMap::from([(staker_sk.to_public(), 1u64)]),
+        };
+        let mut state = ConsensusState::new(cfg, staker_sk, 0);
+
+        for _ in 0..2 {
+            state.propose(|block| block.next_block(&nstore).sealed(block.seal_info).unwrap());
+            for msg in state.drain_msg() {
+                state.process_msg(msg, &nstore).unwrap();
+            }
+            for msg in state.drain_msg() {
+                state.process_msg(msg, &nstore).unwrap();
+            }
+            state.tick_epoch();
+        }
+
+        let chain = state.longest_notarized_chain();
+        assert!(
+            chain.len() >= 3,
+            "expected at least genesis plus two notarized blocks"
+        );
+        let first = chain[1];
+        let second = chain[2];
+        assert!(
+            !state.is_finalized(&first),
+            "block requires a notarized grandchild to finalize"
+        );
+        assert!(
+            !state.is_finalized(&second),
+            "second block finalizes only with a notarized child at the next epoch"
+        );
+
+        state.propose(|block| block.next_block(&nstore).sealed(block.seal_info).unwrap());
+        for msg in state.drain_msg() {
+            state.process_msg(msg, &nstore).unwrap();
+        }
+        for msg in state.drain_msg() {
+            state.process_msg(msg, &nstore).unwrap();
+        }
+        state.tick_epoch();
+
+        let chain = state.longest_notarized_chain();
+        assert!(
+            chain.len() >= 4,
+            "expected genesis plus three notarized blocks"
+        );
+        let genesis_hash = chain[0];
+        let third = chain[3];
+
+        assert!(state.is_finalized(&genesis_hash));
+        assert!(state.is_finalized(&first));
+        assert!(state.is_finalized(&second));
+        assert!(
+            !state.is_finalized(&third),
+            "third block finalizes only once it gains a notarized child"
+        );
     }
 }
