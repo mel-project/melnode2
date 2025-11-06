@@ -7,6 +7,9 @@ use novasmt::NodeStore;
 use serde::{Deserialize, Serialize};
 use tmelcrypt::{Ed25519PK, Ed25519SK, HashVal};
 
+const PROPOSE_DOMAIN: &[u8] = b"sl-internal-propose";
+const VOTE_DOMAIN: &[u8] = b"sl-internal-vote";
+
 pub struct ConsensusState {
     seed: HashVal,
     genesis: Block,
@@ -49,33 +52,43 @@ impl ConsensusState {
     }
 
     pub fn propose(&mut self, gen_prop: impl FnOnce(&Block) -> Block) {
-        // TODO: not everybody is supposed to propose every epoch, but we're going to do so anyway.
-        let longest_chain = self.longest_notarized_chain();
-        let parent_hash = longest_chain
-            .last()
-            .copied()
-            .unwrap_or_else(|| self.genesis_hash());
+        if self.proposer_for_epoch(self.current_epoch) == self.my_sk.to_public() {
+            let longest_chain = self.longest_notarized_chain();
+            let parent_hash = longest_chain
+                .last()
+                .copied()
+                .unwrap_or_else(|| self.genesis_hash());
 
-        let proposal = {
-            let parent_block = self
-                .get_block(parent_hash)
-                .expect("parent block for proposal must exist");
-            gen_prop(parent_block)
-        };
+            let proposal = {
+                let parent_block = self
+                    .get_block(parent_hash)
+                    .expect("parent block for proposal must exist");
+                gen_prop(parent_block)
+            };
 
-        assert_eq!(
-            proposal.header.prev, parent_hash,
-            "generated proposal must extend the parent block"
-        );
+            assert_eq!(
+                proposal.header.prev, parent_hash,
+                "generated proposal must extend the parent block"
+            );
 
-        self.outgoing_msg
-            .push(ConsensusMsg::Propose(proposal.clone(), self.current_epoch));
+            let header_hash = tmelcrypt::hash_single(
+                &bcs::to_bytes(&proposal.header).expect("header serializes"),
+            );
+            let signature = self
+                .my_sk
+                .sign(&tmelcrypt::hash_keyed(PROPOSE_DOMAIN, header_hash));
+            self.outgoing_msg.push(ConsensusMsg::Propose(
+                proposal.clone(),
+                self.current_epoch,
+                signature,
+            ));
+        }
     }
 
     pub fn process_msg(&mut self, msg: ConsensusMsg, store: &impl NodeStore) -> anyhow::Result<()> {
         match msg {
-            ConsensusMsg::Propose(block, epoch) => {
-                self.add_block(block, epoch, store)?;
+            ConsensusMsg::Propose(block, epoch, signature) => {
+                self.add_proposal(block, epoch, signature, store)?;
                 self.generate_votes()
             }
             ConsensusMsg::Vote(block_hash, voter, vote) => self.add_vote(block_hash, voter, vote),
@@ -98,12 +111,20 @@ impl ConsensusState {
         }
     }
 
-    fn add_block(
+    fn add_proposal(
         &mut self,
         block: Block,
         epoch: u64,
+        signature: Vec<u8>,
         store: &impl NodeStore,
     ) -> anyhow::Result<()> {
+        let proposer = self.proposer_for_epoch(epoch);
+        let block_hash = tmelcrypt::hash_single(&bcs::to_bytes(&block.header)?);
+        let sig_msg = tmelcrypt::hash_keyed(PROPOSE_DOMAIN, block_hash);
+        if !proposer.verify(&sig_msg, &signature) {
+            anyhow::bail!("proposal signature invalid or proposer mismatch");
+        }
+
         let prev = self
             .get_block(block.header.prev)
             .context("parent block does not exist")?;
@@ -132,10 +153,7 @@ impl ConsensusState {
         if !self.blocks.contains_key(&block_hash) {
             anyhow::bail!("block being voted for doesn't exist")
         }
-        if !voter.verify(
-            &tmelcrypt::hash_keyed(b"sl-internal-vote", block_hash),
-            &vote,
-        ) {
+        if !voter.verify(&tmelcrypt::hash_keyed(VOTE_DOMAIN, block_hash), &vote) {
             anyhow::bail!("vote signature is wrong")
         }
         self.blocks
@@ -221,7 +239,7 @@ impl ConsensusState {
                     proposal,
                     self.my_sk.to_public(),
                     self.my_sk.sign(&tmelcrypt::hash_keyed(
-                        b"sl-internal-vote",
+                        VOTE_DOMAIN,
                         tmelcrypt::hash_single(&bcs::to_bytes(&nfo.block.header)?),
                     )),
                 );
@@ -421,7 +439,7 @@ fn uniform_rand_modulo(mut seed: HashVal, modulo: u64) -> u64 {
 
 #[derive(Serialize, Deserialize)]
 pub enum ConsensusMsg {
-    Propose(Block, u64),
+    Propose(Block, u64, Vec<u8>),
     Vote(HashVal, Ed25519PK, Vec<u8>),
 }
 
@@ -431,9 +449,56 @@ mod tests {
 
     use mel2_stf::Block;
     use novasmt::InMemoryStore;
-    use tmelcrypt::Ed25519SK;
+    use tmelcrypt::{Ed25519SK, HashVal};
 
-    use crate::staker::consensus_state::{ConsensusConfig, ConsensusState};
+    use crate::staker::consensus_state::{ConsensusConfig, ConsensusMsg, ConsensusState};
+
+    fn clone_msg(msg: &ConsensusMsg) -> ConsensusMsg {
+        match msg {
+            ConsensusMsg::Propose(block, epoch, sig) => {
+                ConsensusMsg::Propose(block.clone(), *epoch, sig.clone())
+            }
+            ConsensusMsg::Vote(hash, voter, vote) => {
+                ConsensusMsg::Vote(*hash, *voter, vote.clone())
+            }
+        }
+    }
+
+    fn flush_network(
+        validators: &mut [ConsensusState],
+        store: &InMemoryStore,
+        lost_idx: usize,
+    ) -> bool {
+        let mut lost_sent = false;
+        loop {
+            let mut sent_any = false;
+            for idx in 0..validators.len() {
+                let outgoing = {
+                    let state = &mut validators[idx];
+                    state.drain_msg()
+                };
+                if outgoing.is_empty() {
+                    continue;
+                }
+                sent_any = true;
+                if idx == lost_idx {
+                    lost_sent = true;
+                    continue;
+                }
+                for msg in outgoing {
+                    for validator in validators.iter_mut() {
+                        validator
+                            .process_msg(clone_msg(&msg), store)
+                            .expect("processing consensus message");
+                    }
+                }
+            }
+            if !sent_any {
+                break;
+            }
+        }
+        lost_sent
+    }
 
     #[test]
     fn basic_consensus() {
@@ -526,5 +591,67 @@ mod tests {
             !state.is_finalized(&third),
             "third block finalizes only once it gains a notarized child"
         );
+    }
+
+    #[test]
+    fn five_validators_with_blackholed_peer() {
+        const VALIDATOR_COUNT: usize = 5;
+        let lost_idx = VALIDATOR_COUNT - 1;
+        let nstore = InMemoryStore::default();
+        let genesis = Block::testnet_genesis();
+        let seed = HashVal::random();
+
+        let mut validator_sks = Vec::with_capacity(VALIDATOR_COUNT);
+        for _ in 0..VALIDATOR_COUNT {
+            validator_sks.push(Ed25519SK::generate());
+        }
+        let vote_weights = validator_sks
+            .iter()
+            .map(|sk| (sk.to_public(), 1u64))
+            .collect::<BTreeMap<_, _>>();
+
+        let mut validators: Vec<ConsensusState> = validator_sks
+            .into_iter()
+            .map(|sk| {
+                ConsensusState::new(
+                    ConsensusConfig {
+                        seed,
+                        genesis: genesis.clone(),
+                        vote_weights: vote_weights.clone(),
+                    },
+                    sk,
+                    0,
+                )
+            })
+            .collect();
+
+        let mut lost_emitted = false;
+        for _ in 0..8 {
+            for validator in validators.iter_mut() {
+                validator
+                    .propose(|block| block.next_block(&nstore).sealed(block.seal_info).unwrap());
+            }
+            lost_emitted |= flush_network(&mut validators, &nstore, lost_idx);
+            for validator in validators.iter_mut() {
+                validator.tick_epoch();
+            }
+        }
+
+        assert!(lost_emitted, "the black-holed validator never produced a message");
+        let reference_chain = validators[0].longest_notarized_chain();
+        assert!(
+            reference_chain.len() >= 4,
+            "expected at least genesis plus three notarized blocks"
+        );
+        for (idx, state) in validators.iter().enumerate() {
+            if idx == lost_idx {
+                continue;
+            }
+            assert_eq!(
+                state.longest_notarized_chain().last(),
+                reference_chain.last(),
+                "validator {idx} disagrees on the notarized head"
+            );
+        }
     }
 }
