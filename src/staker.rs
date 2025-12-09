@@ -1,4 +1,5 @@
 mod consensus_state;
+mod stake_net;
 
 use std::{sync::Arc, thread::JoinHandle, time::Duration};
 

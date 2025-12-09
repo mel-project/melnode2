@@ -437,7 +437,7 @@ fn uniform_rand_modulo(mut seed: HashVal, modulo: u64) -> u64 {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub enum ConsensusMsg {
     Propose(Block, u64, Vec<u8>),
     Vote(HashVal, Ed25519PK, Vec<u8>),

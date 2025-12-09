@@ -10,6 +10,7 @@ use crate::{
     storage::Storage,
 };
 
+pub mod network;
 mod node;
 mod rpc;
 mod staker;
